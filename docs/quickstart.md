@@ -9,7 +9,7 @@ replacement stubs for Solidity files that need hand-written TypeScript.
 Clone extruder somewhere
 
 ```bash
-git clone <REPO_URL> ~/tools/extruder
+git clone https://github.com/stompgg/extrude ~/tools/extruder
 cd ~/tools/extruder
 python3 -m pip install -e ./transpiler
 extruder --help

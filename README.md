@@ -23,7 +23,7 @@ into TypeScript you can run in Node or the browser.
 ## Install
 
 ```bash
-git clone <REPO_URL> ~/tools/extruder
+git clone https://github.com/stompgg/extrude ~/tools/extruder
 cd ~/tools/extruder
 
 # Optional: install the standalone CLI in editable mode.

@@ -1,0 +1,866 @@
+"""
+Expression generation for Solidity to TypeScript transpilation.
+
+This module handles the generation of TypeScript code from Solidity expression
+AST nodes, including literals, identifiers, operators, function calls, and
+member/index access.
+"""
+
+from typing import Optional, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .context import CodeGenerationContext
+    from ..type_system import TypeRegistry
+
+from .base import BaseGenerator
+from .context import RESERVED_JS_METHODS
+from .type_converter import TypeConverter
+from ..type_system.mappings import get_type_max, get_type_min
+from ..parser.ast_nodes import (
+    Expression,
+    Literal,
+    Identifier,
+    BinaryOperation,
+    UnaryOperation,
+    TernaryOperation,
+    FunctionCall,
+    MemberAccess,
+    IndexAccess,
+    NewExpression,
+    TupleExpression,
+    ArrayLiteral,
+    TypeCast,
+    TypeName,
+)
+
+
+class ExpressionGenerator(BaseGenerator):
+    """
+    Generates TypeScript code from Solidity expression AST nodes.
+
+    This class handles all expression types including:
+    - Literals (numbers, strings, booleans, hex)
+    - Identifiers (variables, functions, special names)
+    - Binary and unary operations
+    - Function calls (regular, type casts, special functions)
+    - Member access (properties, special patterns)
+    - Index access (arrays, mappings)
+    - New expressions (arrays, contracts)
+    - Tuples and array literals
+    - Type casts
+    """
+
+    def __init__(
+        self,
+        ctx: 'CodeGenerationContext',
+        type_converter: TypeConverter,
+        registry: Optional['TypeRegistry'] = None,
+    ):
+        """
+        Initialize the expression generator.
+
+        Args:
+            ctx: The code generation context
+            type_converter: The type converter for type-related operations
+            registry: Optional type registry for lookups
+        """
+        super().__init__(ctx)
+        self._type_converter = type_converter
+        self._registry = registry
+        self._abi_inferer: Optional['AbiTypeInferer'] = None
+
+    def _get_abi_inferer(self) -> 'AbiTypeInferer':
+        """Get or create an AbiTypeInferer with current context state."""
+        from .abi import AbiTypeInferer
+        # Rebuild on every call since context (var_types, method_return_types) changes per function
+        self._abi_inferer = AbiTypeInferer(
+            var_types=self._ctx.var_types,
+            known_enums=self._ctx.known_enums,
+            known_contracts=self._ctx.known_contracts,
+            known_interfaces=self._ctx.known_interfaces,
+            known_struct_fields=self._ctx.known_struct_fields,
+            method_return_types=self._ctx.current_method_return_types,
+            type_converter=self._type_converter,
+        )
+        return self._abi_inferer
+
+    # =========================================================================
+    # MAIN DISPATCH
+    # =========================================================================
+
+    def generate(self, expr: Expression) -> str:
+        """Generate TypeScript expression from AST node.
+
+        Args:
+            expr: The expression AST node
+
+        Returns:
+            The TypeScript code string
+        """
+        if expr is None:
+            return ''
+
+        if isinstance(expr, Literal):
+            return self.generate_literal(expr)
+        elif isinstance(expr, Identifier):
+            return self.generate_identifier(expr)
+        elif isinstance(expr, BinaryOperation):
+            return self.generate_binary_operation(expr)
+        elif isinstance(expr, UnaryOperation):
+            return self.generate_unary_operation(expr)
+        elif isinstance(expr, TernaryOperation):
+            return self.generate_ternary_operation(expr)
+        elif isinstance(expr, FunctionCall):
+            return self.generate_function_call(expr)
+        elif isinstance(expr, MemberAccess):
+            return self.generate_member_access(expr)
+        elif isinstance(expr, IndexAccess):
+            return self.generate_index_access(expr)
+        elif isinstance(expr, NewExpression):
+            return self.generate_new_expression(expr)
+        elif isinstance(expr, TupleExpression):
+            return self.generate_tuple_expression(expr)
+        elif isinstance(expr, ArrayLiteral):
+            return self.generate_array_literal(expr)
+        elif isinstance(expr, TypeCast):
+            return self.generate_type_cast(expr)
+
+        return '/* unknown expression */'
+
+    # =========================================================================
+    # LITERALS
+    # =========================================================================
+
+    def generate_literal(self, lit: Literal) -> str:
+        """Generate TypeScript code for a literal."""
+        if lit.kind == 'number':
+            # Use bigint literal syntax (Xn) which is more efficient than BigInt(X)
+            # For large numbers (> 2^53), use BigInt("X") to avoid precision loss
+            clean_value = lit.value.replace('_', '')
+            if len(clean_value) > 15:
+                return f'BigInt("{lit.value}")'
+            return f'{lit.value}n'
+        elif lit.kind == 'hex':
+            # Hex literals: 0x... -> BigInt("0x...")
+            return f'BigInt("{lit.value}")'
+        elif lit.kind == 'hex_string':
+            # Hex string literals: hex"0f" -> "0x0f"
+            return f'"{lit.value}"'
+        elif lit.kind == 'string':
+            return lit.value  # Already has quotes
+        elif lit.kind == 'bool':
+            return lit.value
+        return lit.value
+
+    def generate_array_literal(self, arr: ArrayLiteral) -> str:
+        """Generate TypeScript code for an array literal."""
+        elements = ', '.join([self.generate(e) for e in arr.elements])
+        return f'[{elements}]'
+
+    # =========================================================================
+    # IDENTIFIERS
+    # =========================================================================
+
+    def generate_identifier(self, ident: Identifier) -> str:
+        """Generate TypeScript code for an identifier."""
+        name = ident.name
+
+        # Handle special identifiers
+        # In base constructor arguments, we can't use 'this' before super()
+        # Use placeholder values instead
+        if name == 'msg':
+            if self._ctx._in_base_constructor_args:
+                return '{ sender: ADDRESS_ZERO, value: 0n, data: "0x" as `0x${string}` }'
+            return 'this._msg'
+        elif name == 'block':
+            if self._ctx._in_base_constructor_args:
+                return '{ timestamp: 0n, number: 0n }'
+            return 'this._block'
+        elif name == 'tx':
+            if self._ctx._in_base_constructor_args:
+                return '{ origin: ADDRESS_ZERO }'
+            return 'this._tx'
+        elif name == 'this':
+            return 'this'
+
+        # Add ClassName. prefix for static constants (check before global constants)
+        if name in self._ctx.current_static_vars:
+            return f'{self._ctx.current_class_name}.{name}'
+
+        # Add module prefixes for known types (but not for self-references)
+        qualified = self.get_qualified_name(name)
+        if qualified != name:
+            return qualified
+
+        # Add this. prefix for state variables and methods (but not local vars)
+        if name not in self._ctx.current_local_vars:
+            if name in self._ctx.current_state_vars or name in self._ctx.current_methods:
+                # Use underscore prefix for public mappings (backing field)
+                if name in self._ctx.known_public_mappings and name in self._ctx.current_state_vars:
+                    return f'this._{name}'
+                return f'this.{name}'
+
+        return name
+
+    # =========================================================================
+    # OPERATORS
+    # =========================================================================
+
+    def _needs_parens(self, expr: Expression) -> bool:
+        """Check if expression needs parentheses when used as operand."""
+        # Simple expressions don't need parens
+        if isinstance(expr, (Literal, Identifier)):
+            return False
+        if isinstance(expr, MemberAccess):
+            return False
+        if isinstance(expr, IndexAccess):
+            return False
+        if isinstance(expr, FunctionCall):
+            return False
+        return True
+
+    def generate_binary_operation(self, op: BinaryOperation) -> str:
+        """Generate TypeScript code for a binary operation."""
+        # Special handling for address(x) == address(0) or address(x) != address(0)
+        # When x might be null/undefined, we need to add a null check
+        if op.operator in ('==', '!='):
+            null_safe = self._generate_null_safe_address_comparison(op)
+            if null_safe:
+                return null_safe
+
+        left = self.generate(op.left)
+        right = self.generate(op.right)
+        operator = op.operator
+
+        # For assignment operators, don't wrap tuple on left side (destructuring)
+        is_assignment = operator in ('=', '+=', '-=', '*=', '/=', '%=', '|=', '&=', '^=')
+
+        # Only add parens around complex sub-expressions
+        if not (is_assignment and isinstance(op.left, TupleExpression)):
+            if self._needs_parens(op.left):
+                left = f'({left})'
+        if self._needs_parens(op.right):
+            right = f'({right})'
+
+        return f'{left} {operator} {right}'
+
+    def _generate_null_safe_address_comparison(self, op: BinaryOperation) -> Optional[str]:
+        """Generate null-safe address comparison for address(x) == address(0) patterns.
+
+        In Solidity, address(contractRef) returns address(0) when the reference is null.
+        In TypeScript, we access contractRef._contractAddress, which throws if null.
+        This method detects this pattern and generates null-safe comparisons.
+
+        Note: This only applies to contract/interface references, NOT to:
+        - Numeric casts like address(uint160(...))
+        - Literals like address(0x...)
+        - Already-address expressions like msg.sender
+        """
+        operator = op.operator
+        if operator not in ('==', '!='):
+            return None
+
+        # Check if one side is address(0) and the other is address(something)
+        left_is_zero = self._is_zero_address(op.left)
+        right_is_zero = self._is_zero_address(op.right)
+
+        if not (left_is_zero or right_is_zero):
+            return None
+
+        # Get the non-zero side
+        addr_expr = op.right if left_is_zero else op.left
+
+        # Check if it's address(someContract) where someContract might be null
+        if not isinstance(addr_expr, TypeCast):
+            return None
+        if addr_expr.type_name.name != 'address':
+            return None
+
+        inner = addr_expr.expression
+
+        # Skip if inner is a literal
+        if isinstance(inner, Literal):
+            return None
+
+        # Skip if inner is 'this', 'msg', 'tx' (always defined)
+        if isinstance(inner, Identifier) and inner.name in ('this', 'msg', 'tx'):
+            return None
+
+        # Skip if inner is a numeric type cast (e.g., uint160(...), uint256(...))
+        # These are converting numbers to addresses, not contract references
+        if isinstance(inner, TypeCast):
+            inner_type = inner.type_name.name
+            if inner_type.startswith('uint') or inner_type.startswith('int'):
+                return None
+
+        # Skip if inner is a numeric function call result
+        # (e.g., something that returns uint256)
+        if isinstance(inner, FunctionCall):
+            # If it's a type cast function (like uint160(...)), skip
+            if isinstance(inner.function, Identifier):
+                func_name = inner.function.name
+                if func_name.startswith('uint') or func_name.startswith('int'):
+                    return None
+
+        # Generate the inner expression (the contract reference)
+        inner_code = self.generate(inner)
+        zero_addr = '"0x0000000000000000000000000000000000000000"'
+
+        # For != address(0): x != null && x._contractAddress != zero
+        # For == address(0): x == null || x._contractAddress == zero
+        if operator == '!=':
+            return f'({inner_code} != null && {inner_code}._contractAddress != {zero_addr})'
+        else:  # ==
+            return f'({inner_code} == null || {inner_code}._contractAddress == {zero_addr})'
+
+    def _is_zero_address(self, expr: Expression) -> bool:
+        """Check if an expression is address(0) or a zero address literal."""
+        if isinstance(expr, Literal):
+            val = expr.value
+            # Check for 0 or 0x0...0
+            if val == '0' or val == '0x0' or val == '0x0000000000000000000000000000000000000000':
+                return True
+        if isinstance(expr, TypeCast) and expr.type_name.name == 'address':
+            inner = expr.expression
+            if isinstance(inner, Literal):
+                val = inner.value
+                if val == '0' or val == '0x0' or val == '0x0000000000000000000000000000000000000000':
+                    return True
+        return False
+
+    def generate_unary_operation(self, op: UnaryOperation) -> str:
+        """Generate TypeScript code for a unary operation."""
+        operand = self.generate(op.operand)
+        operator = op.operator
+
+        if op.is_prefix:
+            if self._needs_parens(op.operand):
+                return f'{operator}({operand})'
+            return f'{operator}{operand}'
+        else:
+            return f'({operand}){operator}'
+
+    def generate_ternary_operation(self, op: TernaryOperation) -> str:
+        """Generate TypeScript code for a ternary operation."""
+        cond = self.generate(op.condition)
+        true_expr = self.generate(op.true_expression)
+        false_expr = self.generate(op.false_expression)
+        return f'({cond} ? {true_expr} : {false_expr})'
+
+    # =========================================================================
+    # FUNCTION CALLS
+    # =========================================================================
+
+    def generate_function_call(self, call: FunctionCall) -> str:
+        """Generate TypeScript code for a function call."""
+        # Handle new expressions
+        if isinstance(call.function, NewExpression):
+            return self._generate_new_call(call)
+
+        # Handle low-level calls (.call, .send, .transfer, .delegatecall, .staticcall)
+        # These are ETH transfer operations meaningless in simulation
+        # Return [true, "0x"] to match the (bool success, bytes returnData) shape
+        if isinstance(call.function, MemberAccess) and call.function.member in (
+            'call', 'send', 'transfer', 'delegatecall', 'staticcall'
+        ):
+            return '[true, "0x"]'
+
+        func = self.generate(call.function)
+
+        # Handle abi.decode specially - need to swap args and format types
+        if isinstance(call.function, MemberAccess):
+            result = self._handle_abi_call(call)
+            if result is not None:
+                return result
+
+        args = ', '.join([self.generate(a) for a in call.arguments])
+
+        # Handle special function calls
+        if isinstance(call.function, Identifier):
+            name = call.function.name
+            result = self._handle_special_function(call, name, args)
+            if result is not None:
+                return result
+
+            # Handle type casts (uint256(x), etc.) - simplified for simulation
+            result = self._handle_type_cast_call(call, name, args)
+            if result is not None:
+                return result
+
+        # For bare function calls that start with _ (internal/protected methods),
+        # add this. prefix if not already there.
+        if isinstance(call.function, Identifier):
+            name = call.function.name
+            if name.startswith('_') and not func.startswith('this.'):
+                return f'this.{func}({args})'
+
+        # Handle public state variable getter calls
+        if not args and isinstance(call.function, MemberAccess):
+            member_name = call.function.member
+            if member_name in self._ctx.known_public_state_vars:
+                return func
+
+        # Handle EnumerableSetLib method calls
+        if isinstance(call.function, MemberAccess):
+            member_name = call.function.member
+            if member_name == 'length':
+                return func
+
+        # Handle library struct instantiation: Library.StructName({field: value, ...})
+        # Check if this is a struct type being instantiated
+        if isinstance(call.function, MemberAccess):
+            struct_name = call.function.member
+            if struct_name in self._ctx.known_structs:
+                # Check for named arguments (struct initialization syntax)
+                if call.named_arguments:
+                    field_assignments = [
+                        f'{name}: {self.generate(value)}'
+                        for name, value in call.named_arguments.items()
+                    ]
+                    return '{ ' + ', '.join(field_assignments) + ' }'
+                # No named args - use default creator
+                return f'createDefault{struct_name}()'
+
+        return f'{func}({args})'
+
+    def _generate_new_call(self, call: FunctionCall) -> str:
+        """Generate code for a 'new' expression call."""
+        if call.function.type_name.is_array:
+            # Array allocation: new Type[](size) -> new Array(size)
+            if call.arguments:
+                size_arg = call.arguments[0]
+                size = self.generate(size_arg)
+                # Convert BigInt to Number for array size
+                if size.startswith('BigInt('):
+                    inner = size[7:-1]
+                    if inner.isdigit():
+                        size = inner
+                    else:
+                        size = f'Number({size})'
+                elif size.endswith('n') and size[:-1].isdigit():
+                    size = size[:-1]
+                elif isinstance(size_arg, Identifier):
+                    size = f'Number({size})'
+                return f'new Array({size})'
+            return '[]'
+        else:
+            # Contract/class creation: new Contract(args)
+            type_name = call.function.type_name.name
+            if type_name == 'string':
+                return '""'
+            if type_name.startswith('bytes') and type_name != 'bytes32':
+                return '""'
+            args = ', '.join([self.generate(arg) for arg in call.arguments])
+            return f'new {type_name}({args})'
+
+    def _handle_abi_call(self, call: FunctionCall) -> Optional[str]:
+        """Handle abi.encode/decode/encodePacked calls."""
+        if not isinstance(call.function, MemberAccess):
+            return None
+        if not isinstance(call.function.expression, Identifier):
+            return None
+        if call.function.expression.name != 'abi':
+            return None
+
+        if call.function.member == 'decode':
+            if len(call.arguments) >= 2:
+                data_arg = self.generate(call.arguments[0])
+                types_arg = call.arguments[1]
+                type_params = self._convert_abi_types(types_arg)
+                decode_expr = f'decodeAbiParameters({type_params}, {data_arg} as `0x${{string}}`)'
+
+                # Check if decoding a single value - Solidity returns value directly,
+                # but viem always returns a tuple, so we need to extract [0]
+                is_single_type = False
+                single_type = None
+
+                # Single type parses as Identifier (e.g., (int32) -> Identifier('int32'))
+                if isinstance(types_arg, Identifier):
+                    is_single_type = True
+                    single_type = types_arg
+                # Or could be a TupleExpression with one component
+                elif isinstance(types_arg, TupleExpression) and len(types_arg.components) == 1:
+                    is_single_type = True
+                    single_type = types_arg.components[0]
+
+                if is_single_type and single_type:
+                    type_name = self._get_abi_type_name(single_type)
+                    # Small integers (int8-int32, uint8-uint32) return number from viem,
+                    # but TypeScript code expects bigint
+                    if type_name and self._is_small_integer_type(type_name):
+                        return f'BigInt({decode_expr}[0])'
+                    return f'{decode_expr}[0]'
+
+                return decode_expr
+        elif call.function.member == 'encode':
+            if call.arguments:
+                type_params = self._infer_abi_types_from_values(call.arguments)
+                values = ', '.join([self._convert_abi_value(a) for a in call.arguments])
+                return f'encodeAbiParameters({type_params}, [{values}])'
+        elif call.function.member == 'encodePacked':
+            if call.arguments:
+                types = self._infer_packed_abi_types(call.arguments)
+                values = ', '.join([self._convert_abi_value(a) for a in call.arguments])
+                return f'encodePacked({types}, [{values}])'
+
+        return None
+
+    def _handle_special_function(self, call: FunctionCall, name: str, args: str) -> Optional[str]:
+        """Handle special built-in functions."""
+        if name == 'keccak256':
+            # Handle keccak256("string") - need to convert string to hex for viem
+            if len(call.arguments) == 1:
+                arg = call.arguments[0]
+                if isinstance(arg, Literal) and arg.kind == 'string':
+                    # Plain string literal - use stringToHex
+                    return f'keccak256(stringToHex({self.generate(arg)}))'
+            return f'keccak256({args})'
+        elif name == 'sha256':
+            # Special case: sha256(abi.encode("string")) -> sha256String("string")
+            if len(call.arguments) == 1:
+                arg = call.arguments[0]
+                if isinstance(arg, FunctionCall) and isinstance(arg.function, MemberAccess):
+                    if (isinstance(arg.function.expression, Identifier) and
+                        arg.function.expression.name == 'abi' and
+                        arg.function.member == 'encode'):
+                        if len(arg.arguments) == 1:
+                            inner_arg = arg.arguments[0]
+                            if isinstance(inner_arg, Literal) and inner_arg.kind == 'string':
+                                return f'sha256String({self.generate(inner_arg)})'
+            return f'sha256({args})'
+        elif name == 'abi':
+            return f'abi.{args}'
+        elif name == 'require':
+            if len(call.arguments) >= 2:
+                cond = self.generate(call.arguments[0])
+                msg = self.generate(call.arguments[1])
+                return f'if (!({cond})) throw new Error({msg})'
+            else:
+                cond = self.generate(call.arguments[0])
+                return f'if (!({cond})) throw new Error("Require failed")'
+        elif name == 'assert':
+            cond = self.generate(call.arguments[0])
+            return f'if (!({cond})) throw new Error("Assert failed")'
+        elif name == 'type':
+            return f'/* type({args}) */'
+
+        return None
+
+    def _handle_type_cast_call(self, call: FunctionCall, name: str, args: str) -> Optional[str]:
+        """Handle type cast function calls (uint256(x), address(x), etc.)."""
+        if self._is_primitive_cast_name(name):
+            if len(call.arguments) != 1:
+                return args
+            cast = TypeCast(type_name=TypeName(name=name), expression=call.arguments[0])
+            return self._type_converter.generate_type_cast(cast, self.generate)
+        elif name.startswith('I') and len(name) > 1 and name[1].isupper():
+            # Interface cast
+            return self._handle_interface_cast(call, args)
+        elif name[0].isupper() and call.named_arguments:
+            # Struct constructor with named args
+            qualified = self.get_qualified_name(name)
+            if self._registry and name in self._registry.struct_paths:
+                self._ctx.external_structs_used[name] = self._registry.struct_paths[name]
+            fields = ', '.join([
+                f'{k}: {self.generate(v)}'
+                for k, v in call.named_arguments.items()
+            ])
+            return f'{{ {fields} }} as {qualified}'
+        elif name[0].isupper() and not args:
+            # Struct with no args
+            qualified = self.get_qualified_name(name)
+            if self._registry and name in self._registry.struct_paths:
+                self._ctx.external_structs_used[name] = self._registry.struct_paths[name]
+            return f'{{}} as {qualified}'
+        elif name in self._ctx.known_enums:
+            qualified = self.get_qualified_name(name)
+            return f'Number({args}) as {qualified}'
+
+        return None
+
+    @staticmethod
+    def _is_primitive_cast_name(name: str) -> bool:
+        return (
+            name in ('address', 'bool', 'bytes', 'bytes32', 'payable', 'string')
+            or name.startswith('uint')
+            or name.startswith('int')
+            or (name.startswith('bytes') and name[5:].isdigit())
+        )
+
+    def _handle_interface_cast(self, call: FunctionCall, args: str) -> str:
+        """Handle interface type cast like IEffect(address(x)).
+
+        Generates Contract.at(expr) for runtime address-to-instance resolution,
+        except for 'this' which is always the current contract instance.
+        """
+        if call.arguments and len(call.arguments) == 1:
+            arg = call.arguments[0]
+            # Check for IEffect(address(x)) pattern
+            if isinstance(arg, FunctionCall) and isinstance(arg.function, Identifier):
+                if arg.function.name == 'address':
+                    if arg.arguments and len(arg.arguments) == 1:
+                        inner_arg = arg.arguments[0]
+                        if isinstance(inner_arg, Identifier) and inner_arg.name == 'this':
+                            return '(this as any)'
+                        inner_expr = self.generate(inner_arg)
+                        return f'Contract.at({inner_expr})'
+            # Check for TypeCast address(x) pattern
+            if isinstance(arg, TypeCast) and arg.type_name.name == 'address':
+                inner_arg = arg.expression
+                if isinstance(inner_arg, Identifier) and inner_arg.name == 'this':
+                    return '(this as any)'
+                inner_expr = self.generate(inner_arg)
+                return f'Contract.at({inner_expr})'
+        if args:
+            return f'Contract.at({args})'
+        return '{}'
+
+    # =========================================================================
+    # MEMBER ACCESS
+    # =========================================================================
+
+    def generate_member_access(self, access: MemberAccess) -> str:
+        """Generate TypeScript code for member access."""
+        expr = self.generate(access.expression)
+        member = access.member
+
+        # Handle special cases
+        if isinstance(access.expression, Identifier):
+            if access.expression.name == 'abi':
+                if member == 'encode':
+                    return 'encodeAbiParameters'
+                elif member == 'encodePacked':
+                    return 'encodePacked'
+                elif member == 'decode':
+                    return 'decodeAbiParameters'
+            elif access.expression.name == 'type':
+                return f'/* type().{member} */'
+            elif access.expression.name in self._ctx.runtime_replacement_classes:
+                # Runtime replacements keep static call syntax (e.g. ECDSA.recover)
+                self._ctx.libraries_referenced.add(access.expression.name)
+            elif access.expression.name in self._ctx.known_libraries:
+                self._ctx.libraries_referenced.add(access.expression.name)
+                # Use the module-level singleton instance for library calls
+                lib_name = access.expression.name
+                singleton_name = lib_name[0].lower() + lib_name[1:]
+                return f'{singleton_name}.{member}'
+
+        # Handle type(TypeName).max/min
+        if isinstance(access.expression, FunctionCall):
+            if isinstance(access.expression.function, Identifier):
+                if access.expression.function.name == 'type':
+                    if access.expression.arguments:
+                        type_arg = access.expression.arguments[0]
+                        if isinstance(type_arg, Identifier):
+                            type_name = type_arg.name
+                            if member == 'max':
+                                return get_type_max(type_name)
+                            elif member == 'min':
+                                return get_type_min(type_name)
+
+        # Handle .slot for storage variables
+        if member == 'slot':
+            return f'/* {expr}.slot */'
+
+        # Handle .length
+        if member == 'length':
+            base_var_name = self._type_converter.base_var_name(access.expression)
+            if base_var_name and base_var_name in self._ctx.var_types:
+                type_info = self._ctx.var_types[base_var_name]
+                type_name = type_info.name if type_info else ''
+                enumerable_set_types = ('AddressSet', 'Uint256Set', 'Bytes32Set', 'Int256Set')
+                if type_name in enumerable_set_types or type_name.startswith('EnumerableSetLib.'):
+                    return f'{expr}.{member}'
+            return f'BigInt({expr}.{member})'
+
+        # Handle internal access to public mappings - use underscore prefix for backing field
+        if (isinstance(access.expression, Identifier) and
+            access.expression.name == 'this' and
+            member in self._ctx.known_public_mappings and
+            member in self._ctx.current_state_vars):
+            return f'{expr}._{member}'
+
+        return f'{expr}.{member}'
+
+    # =========================================================================
+    # INDEX ACCESS
+    # =========================================================================
+
+    def generate_index_access(self, access: IndexAccess) -> str:
+        """Generate TypeScript code for index access (arrays and mappings)."""
+        base = self.generate(access.base)
+        index = self.generate(access.index)
+
+        # Resolve the container at this access depth. For nested access like
+        # `this.m[a][b]` or `config.p0States[j]`, this descends through
+        # mappings, arrays, and struct fields so we always see the type of
+        # the thing actually being indexed.
+        is_array, is_numeric_keyed_mapping = self._type_converter.index_access_kind(access)
+        mapping_access = is_numeric_keyed_mapping
+        needs_conversion = is_array or mapping_access
+
+        index = self._type_converter.convert_index(
+            access,
+            index,
+            needs_conversion,
+            mapping_access,
+        )
+        return f'{base}[{index}]'
+
+    # =========================================================================
+    # NEW EXPRESSIONS
+    # =========================================================================
+
+    def generate_new_expression(self, expr: NewExpression) -> str:
+        """Generate TypeScript code for a new expression."""
+        type_name = expr.type_name.name
+        if expr.type_name.is_array:
+            return 'new Array()'
+        return f'new {type_name}()'
+
+    # =========================================================================
+    # TUPLES
+    # =========================================================================
+
+    def generate_tuple_expression(self, expr: TupleExpression) -> str:
+        """Generate TypeScript code for a tuple expression."""
+        components = []
+        for comp in expr.components:
+            if comp is None:
+                components.append('')
+            else:
+                components.append(self.generate(comp))
+        return f'[{", ".join(components)}]'
+
+    # =========================================================================
+    # TYPE CASTS
+    # =========================================================================
+
+    def generate_type_cast(self, cast: TypeCast) -> str:
+        """Generate TypeScript code for a type cast."""
+        return self._type_converter.generate_type_cast(cast, self.generate)
+
+    # =========================================================================
+    # ABI ENCODING HELPERS (delegated to AbiTypeInferer)
+    # =========================================================================
+
+    def _convert_abi_types(self, types_expr: Expression) -> str:
+        """Convert Solidity type tuple to viem ABI parameter format."""
+        return self._get_abi_inferer().convert_types_expr(types_expr)
+
+    def _infer_abi_types_from_values(self, args: List[Expression]) -> str:
+        """Infer ABI types from value expressions (for abi.encode)."""
+        return self._get_abi_inferer().infer_abi_types(args)
+
+    def _infer_packed_abi_types(self, args: List[Expression]) -> str:
+        """Infer packed ABI types from value expressions (for abi.encodePacked)."""
+        return self._get_abi_inferer().infer_packed_types(args)
+
+    # ABI type inference is handled by abi.py (AbiTypeInferer class)
+
+    def _convert_abi_value(self, arg: Expression) -> str:
+        """Convert value for ABI encoding, ensuring proper types."""
+        expr = self.generate(arg)
+        var_type_name = None
+
+        if isinstance(arg, Identifier):
+            name = arg.name
+            if name in self._ctx.var_types:
+                type_info = self._ctx.var_types[name]
+                if type_info.name:
+                    var_type_name = type_info.name
+                    if var_type_name in self._ctx.known_enums:
+                        return f'Number({expr})'
+                    if var_type_name in ('bytes32', 'address'):
+                        if type_info.is_array:
+                            return f'{expr} as `0x${{string}}`[]'
+                        else:
+                            return f'{expr} as `0x${{string}}`'
+                    # Small integers that viem expects as number (up to 48 bits)
+                    if var_type_name in ('int8', 'int16', 'int24', 'int32', 'int40', 'int48',
+                                          'uint8', 'uint16', 'uint24', 'uint32', 'uint40', 'uint48'):
+                        return f'Number({expr})'
+
+        if isinstance(arg, MemberAccess):
+            if arg.member in ('sender', 'origin', '_contractAddress'):
+                return f'{expr} as `0x${{string}}`'
+            if isinstance(arg.expression, Identifier):
+                if arg.expression.name == 'Enums':
+                    return f'Number({expr})'
+                var_name = arg.expression.name
+                if var_name in self._ctx.var_types:
+                    type_info = self._ctx.var_types[var_name]
+                    if type_info.name and type_info.name in self._ctx.known_struct_fields:
+                        struct_fields = self._ctx.known_struct_fields[type_info.name]
+                        if arg.member in struct_fields:
+                            field_info = struct_fields[arg.member]
+                            if isinstance(field_info, tuple):
+                                field_type, is_array = field_info
+                            else:
+                                field_type, is_array = field_info, False
+                            if field_type in ('address', 'bytes32'):
+                                if is_array:
+                                    return f'{expr} as `0x${{string}}`[]'
+                                else:
+                                    return f'{expr} as `0x${{string}}`'
+                            if field_type in self._ctx.known_contracts or field_type in self._ctx.known_interfaces:
+                                if is_array:
+                                    return f'{expr}.map((c: any) => c._contractAddress as `0x${{string}}`)'
+                                else:
+                                    return f'{expr}._contractAddress as `0x${{string}}`'
+                            # Small integers that viem expects as number (up to 48 bits)
+                            if field_type in ('int8', 'int16', 'int24', 'int32', 'int40', 'int48',
+                                              'uint8', 'uint16', 'uint24', 'uint32', 'uint40', 'uint48'):
+                                return f'Number({expr})'
+
+        if isinstance(arg, FunctionCall):
+            func_name = None
+            qualifier_name = None
+            if isinstance(arg.function, Identifier):
+                func_name = arg.function.name
+            elif isinstance(arg.function, MemberAccess):
+                func_name = arg.function.member
+                if isinstance(arg.function.expression, Identifier):
+                    qualifier_name = arg.function.expression.name
+            if func_name:
+                if func_name == 'address':
+                    return f'{expr} as `0x${{string}}`'
+                # Solidity built-ins that return bytes32
+                if func_name in ('keccak256', 'sha256', 'blockhash'):
+                    return f'{expr} as `0x${{string}}`'
+                # User-defined functions: resolve return type via TypeRegistry.
+                # Library / contract static call: `Foo.bar(...)`
+                return_type: Optional[str] = None
+                if qualifier_name and qualifier_name in self._ctx.known_method_return_types:
+                    return_type = self._ctx.known_method_return_types[qualifier_name].get(func_name)
+                # Same-contract bare call: `bar(...)` inside the current contract
+                elif qualifier_name is None:
+                    return_type = self._ctx.current_method_return_types.get(func_name)
+                if return_type in ('address', 'bytes32'):
+                    return f'{expr} as `0x${{string}}`'
+
+        if isinstance(arg, TypeCast):
+            type_name = arg.type_name.name
+            if type_name in ('address', 'bytes32'):
+                return f'{expr} as `0x${{string}}`'
+
+        return expr
+
+    def _get_abi_type_name(self, type_expr: Expression) -> Optional[str]:
+        """Extract the type name from an ABI type expression (e.g., int32 from a TypeCast)."""
+        if isinstance(type_expr, TypeCast):
+            return type_expr.type_name.name
+        if isinstance(type_expr, Identifier):
+            # Could be an enum or other named type
+            if type_expr.name in self._ctx.known_enums:
+                return 'uint8'
+            return type_expr.name
+        return None
+
+    def _is_small_integer_type(self, type_name: str) -> bool:
+        """Check if a type is a small integer that viem returns as number instead of bigint."""
+        small_int_types = {
+            'int8', 'int16', 'int24', 'int32',
+            'uint8', 'uint16', 'uint24', 'uint32',
+        }
+        return type_name in small_int_types

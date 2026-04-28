@@ -1,0 +1,17 @@
+{
+  "_comment": "Editor support only — extruder doesn't compile TypeScript itself. The runtime/ files live here as canonical source; they get copied into the consumer's ts-output/runtime/ at transpile time and type-check against the consumer's tsconfig.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": false,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "types": ["node"],
+    "noImplicitAny": false
+  },
+  "include": ["runtime/**/*.ts"]
+}

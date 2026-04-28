@@ -1,0 +1,99 @@
+{
+  "$comment": "Consolidated configuration for the Solidity-to-TypeScript transpiler.",
+  "runtimeReplacements": [
+    {
+      "source": "lib/Ownable.sol",
+      "reason": "Complex Yul assembly for storage slot manipulation and event logging",
+      "runtimeModule": "../runtime",
+      "exports": ["Ownable"],
+      "interface": {
+        "class": "Ownable",
+        "extends": "Contract",
+        "abstract": true,
+        "methods": [
+          { "name": "_guardInitializeOwner", "visibility": "protected", "returns": "boolean" },
+          { "name": "_initializeOwner", "visibility": "protected", "params": ["newOwner: string"], "returns": "void" },
+          { "name": "_setOwner", "visibility": "protected", "params": ["newOwner: string"], "returns": "void" },
+          { "name": "_checkOwner", "visibility": "protected", "returns": "void" },
+          { "name": "_ownershipHandoverValidFor", "visibility": "protected", "returns": "bigint" },
+          { "name": "transferOwnership", "visibility": "public", "params": ["newOwner: string"], "returns": "void" },
+          { "name": "renounceOwnership", "visibility": "public", "returns": "void" },
+          { "name": "requestOwnershipHandover", "visibility": "public", "returns": "void" },
+          { "name": "cancelOwnershipHandover", "visibility": "public", "returns": "void" },
+          { "name": "completeOwnershipHandover", "visibility": "public", "params": ["pendingOwner: string"], "returns": "void" },
+          { "name": "owner", "visibility": "public", "returns": "string" },
+          { "name": "ownershipHandoverExpiresAt", "visibility": "public", "params": ["pendingOwner: string"], "returns": "bigint" }
+        ],
+        "mixin": "  // Ownable mixin (from secondary base class)\n  private _owner: string = '0x0000000000000000000000000000000000000000';\n  protected _initializeOwner(newOwner: string): void {\n    this._owner = newOwner;\n  }\n  protected _checkOwner(): void {\n    if (this._msg.sender !== this._owner) {\n      throw new Error(\"Unauthorized\");\n    }\n  }\n  owner(): string {\n    return this._owner;\n  }"
+      }
+    },
+    {
+      "source": "lib/EnumerableSetLib.sol",
+      "reason": "Complex Yul assembly for gas-optimized set operations with inline storage manipulation",
+      "runtimeModule": "../runtime",
+      "exports": ["EnumerableSetLib", "AddressSet", "Bytes32Set", "Uint256Set", "Int256Set"],
+      "interface": {
+        "class": "EnumerableSetLib",
+        "extends": "Contract",
+        "abstract": false,
+        "types": [
+          { "name": "AddressSet", "kind": "interface" },
+          { "name": "Bytes32Set", "kind": "interface" },
+          { "name": "Uint256Set", "kind": "interface" },
+          { "name": "Int256Set", "kind": "interface" }
+        ],
+        "methods": [
+          { "name": "length", "visibility": "protected", "params": ["set: AddressSet"], "returns": "bigint" },
+          { "name": "contains", "visibility": "protected", "params": ["set: AddressSet", "value: string"], "returns": "boolean" },
+          { "name": "add", "visibility": "protected", "params": ["set: AddressSet", "value: string"], "returns": "boolean" },
+          { "name": "remove", "visibility": "protected", "params": ["set: AddressSet", "value: string"], "returns": "boolean" },
+          { "name": "values", "visibility": "protected", "params": ["set: AddressSet"], "returns": "string[]" },
+          { "name": "at", "visibility": "protected", "params": ["set: AddressSet", "index: bigint"], "returns": "string" }
+        ]
+      }
+    }
+  ],
+  "dependencyOverrides": {
+    "DefaultRuleset": {
+      "_effects": ["StaminaRegen"]
+    },
+    "MegaStarBlast": {
+      "_OVERCLOCK": "Overclock"
+    }
+  },
+  "interfaceAliases": {
+    "IEngine": "Engine",
+    "ITypeCalculator": "TypeCalculator",
+    "ICommitManager": "DefaultCommitManager",
+    "IMatchmaker": "DefaultMatchmaker",
+    "IRandomnessOracle": "DefaultRandomnessOracle",
+    "IRuleset": "DefaultRuleset",
+    "IValidator": "DefaultValidator",
+    "IMonRegistry": "DefaultMonRegistry",
+    "IOwnableMon": "GachaRegistry",
+    "ICPURNG": null,
+    "IGachaRNG": null
+  },
+  "skipFiles": [
+    "lib/Multicall3.sol",
+    "lib/CreateX.sol",
+    "lib/Ownable.sol",
+    "lib/EIP712.sol",
+    "lib/ECDSA.sol",
+    "hooks/SimplePM.sol",
+    "commit-manager/SignedCommitManager.sol",
+    "matchmaker/SignedMatchmaker.sol",
+    "matchmaker/BattleOfferLib.sol",
+    "matchmaker/DefaultMatchmaker.sol",
+    "hooks/BattleHistory.sol",
+    "commit-manager/DefaultCommitManager.sol",
+    "teams/GachaTeamRegistry.sol",
+    "teams/LookupTeamRegistry.sol",
+    "rng/ICPURNG.sol",
+    "rng/IGachaRNG.sol"
+  ],
+  "skipDirs": [
+    "cpu",
+    "gacha"
+  ]
+}
